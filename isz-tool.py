@@ -93,6 +93,9 @@ class ISZ_sdt(ctypes.LittleEndianStructure):
         ("left_size", ctypes.c_int32)
     ]
 
+class StorageMethods:
+    (Zeros, Data, Zlib, Bzip2) = range(4)
+
 class ISZ_File():
     isz_header = ISZ_header()
     isz_segments = []
@@ -107,13 +110,24 @@ class ISZ_File():
         self.isz_segments = []
         self.chunk_pointers = []
 
-    def xor_offuscate(self, data):
+    def xor_obfuscate(self, data):
+        """Obfuscate or de-obfuscate data.
+        
+        Part of the isz files are obfuscated with a simple xor cipher)
+        """
+
         code = (0xb6, 0x8c, 0xa5, 0xde)
         for i in range(len(data)):
             data[i] = data[i] ^ code[i%4]
         return data
 
     def read_chunk_pointers(self):
+        """Read and decode the chunk pointer table.
+        
+        The ISO is divided into chunks and stored using different compression
+        methods (0: bytes of zeros, 1: data, 2: zlib compressed, 3: bzip2
+        compressed).
+        """
         if self.isz_header.chunk_pointers_offset == 0:
             # if chunk_pointers_offset == 0, there is one uncompressed chunk
             tup = (1, self.isz_header.size1)
@@ -126,7 +140,7 @@ class ISZ_File():
         table_size = self.isz_header.pointer_length * self.isz_header.nblock
         self.fp.seek(self.isz_header.chunk_pointers_offset)
         data = bytearray(self.fp.read(table_size))
-        data2 = self.xor_offuscate(data)
+        data2 = self.xor_obfuscate(data)
 
         for i in range(self.isz_header.nblock):
             data = data2[i*3:(i+1)*3]
@@ -159,6 +173,8 @@ class ISZ_File():
         return self.filename
 
     def detect_file_naming_convention(self):
+        """Find the naming convention for the ISZ segments."""
+
         if self.filename.endswith('.isz'):
             name_generators = [self.name_generator_1, self.name_generator_2,
                     self.name_generator_3]
@@ -174,17 +190,21 @@ class ISZ_File():
         return self.name_generator(seg_id)
 
     def check_segment_names(self):
+        """Verify the presence of all the ISZ files (segments)."""
         for i in range(len(self.isz_segments)):
             if not os.path.exists(self.get_segment_name(i)):
                 raise Exception('Unable to find segment number %d' % (i))
 
     def read_segment(self):
+        """Read a segment description from the ISZ file."""
+
         data = bytearray(self.fp.read(ctypes.sizeof(ISZ_sdt)))
-        data = self.xor_offuscate(data)
+        data = self.xor_obfuscate(data)
         seg = ISZ_sdt.from_buffer_copy(data)
         return seg
 
     def read_segments(self):
+        """Read the segment table. Each segment correspond to an ISZ file."""
         if self.isz_header.segment_pointers_offset == 0:
             uniq_seg = ISZ_sdt()
 
@@ -210,6 +230,7 @@ class ISZ_File():
         self.check_segment_names()
 
     def open_isz_file(self, filename):
+        """Open and read the headers of an ISZ file."""
         self.close_file()
         self.filename = filename
         self.fp = open(filename, 'rb')
@@ -224,6 +245,8 @@ class ISZ_File():
         #self.print_chunk_pointers()
 
     def read_data(self, seg_id, offset, size):
+        """Read a block of data from the specified segement."""
+
         fp = open(self.name_generator(seg_id), 'rb')
         fp.seek(offset)
         data = fp.read(size)
@@ -232,6 +255,8 @@ class ISZ_File():
         return data
 
     def get_block(self, block_id):
+        """Locate and read block #block_id."""
+
         (block_type, block_size) = self.chunk_pointers[block_id]
 
         for seg_id in range(len(self.isz_segments)):
@@ -241,11 +266,13 @@ class ISZ_File():
                     segment.number_of_chunks - 1
 
             if block_id >= first_block_id and block_id <= last_block_id:
+                # We have the good segment
                 cur_offset = segment.chunk_offset
 
+                # find the correct offset
                 for i in range(segment.first_chunck_number, block_id):
                     (block_type2, block_size2) = self.chunk_pointers[i]
-                    if block_type2 != 0:
+                    if block_type2 != StorageMethods.Zeros:
                         cur_offset = cur_offset + block_size2
 
                 size_to_read = block_size
@@ -254,6 +281,7 @@ class ISZ_File():
 
                 data = self.read_data(seg_id, cur_offset, size_to_read)
 
+                # A block can be split between two segments
                 if block_id == last_block_id and segment.left_size != 0:
                     data2 = self.read_data(seg_id + 1, 64, segment.left_size)
                     data = b"".join([data, data2])
@@ -266,18 +294,22 @@ class ISZ_File():
         raise Exception('Unable to find the segment of block %d' % (block_id))
 
     def decompress_block(self, block_id):
+        """Read and decompress block block_id."""
+
         (data_type, size) = self.chunk_pointers[block_id]
 
-        if data_type == 0:
+        if data_type == StorageMethods.Zeros:
             return bytes(size)
 
         data = self.get_block(block_id)
 
-        if data_type == 1:
+        if data_type == StorageMethods.Data:
             return data
-        elif data_type == 2:
+
+        elif data_type == StorageMethods.Zlib:
             return zlib.decompress(data)
-        elif data_type == 3:
+
+        elif data_type == StorageMethods.Bzip2:
             data = bytearray(data)
             data[0] = ord('B') #Restore a correct header...
             data[1] = ord('Z')
@@ -285,6 +317,7 @@ class ISZ_File():
             return bz2.decompress(data)
 
     def verify_isz_file(self):
+        """Verify the CRC of the compressed data."""
         crc = 0
 
         for block_id in range(len(self.chunk_pointers)):
@@ -300,6 +333,7 @@ class ISZ_File():
         return crc == self.isz_header.checksum2
 
     def verify_uncompress_isz_file(self):
+        """Verify the CRC of the uncompress data."""
         crc = 0
 
         for block_id in range(len(self.chunk_pointers)):
@@ -311,6 +345,8 @@ class ISZ_File():
         return crc == self.isz_header.checksum1
 
     def extract_to(self, filename):
+        """Extract the .iso to filename."""
+
         iso_fp = open(filename, 'wb')
 
         crc = 0
